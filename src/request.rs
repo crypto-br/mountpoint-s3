@@ -27,6 +27,7 @@ pub struct Request<'a> {
     /// Channel sender for sending the reply
     ch: ChannelSender,
     /// Request raw data
+    #[allow(unused)]
     data: &'a [u8],
     /// Parsed request
     request: ll::AnyRequest<'a>,
@@ -49,7 +50,7 @@ impl<'a> Request<'a> {
     /// Dispatch request to the given filesystem.
     /// This calls the appropriate filesystem operation method for the
     /// request and sends back the returned reply to the kernel
-    pub(crate) fn dispatch<FS: Filesystem>(&self, se: &mut Session<FS>) {
+    pub(crate) fn dispatch<FS: Filesystem>(&self, se: &Session<FS>) {
         debug!("{}", self.request);
         let unique = self.request.unique();
 
@@ -65,10 +66,7 @@ impl<'a> Request<'a> {
         }
     }
 
-    fn dispatch_req<FS: Filesystem>(
-        &self,
-        se: &mut Session<FS>,
-    ) -> Result<Option<Response>, Errno> {
+    fn dispatch_req<FS: Filesystem>(&self, se: &Session<FS>) -> Result<Option<Response>, Errno> {
         let op = self.request.operation().map_err(|_| Errno::ENOSYS)?;
         // Implement allow_root & access check for auto_unmount
         if (se.allowed == SessionACL::RootAndOwner
@@ -147,8 +145,10 @@ impl<'a> Request<'a> {
                     return Err(Errno::EPROTO);
                 }
                 // Remember ABI version supported by kernel
-                se.proto_major = v.major();
-                se.proto_minor = v.minor();
+                se.proto_major
+                    .store(v.major(), std::sync::atomic::Ordering::SeqCst);
+                se.proto_minor
+                    .store(v.minor(), std::sync::atomic::Ordering::SeqCst);
 
                 let mut config = KernelConfig::new(x.capabilities(), x.max_readahead());
                 // Call filesystem init method and give it a chance to return an error
@@ -167,22 +167,24 @@ impl<'a> Request<'a> {
                     config.max_readahead,
                     config.max_write
                 );
-                se.initialized = true;
+                se.initialized
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(Some(x.reply(&config)));
             }
             // Any operation is invalid before initialization
-            _ if !se.initialized => {
+            _ if !se.initialized.load(std::sync::atomic::Ordering::SeqCst) => {
                 warn!("Ignoring FUSE operation before init: {}", self.request);
                 return Err(Errno::EIO);
             }
             // Filesystem destroyed
             ll::Operation::Destroy(x) => {
                 se.filesystem.destroy();
-                se.destroyed = true;
+                se.destroyed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
                 return Ok(Some(x.reply()));
             }
             // Any operation is invalid after destroy
-            _ if se.destroyed => {
+            _ if se.destroyed.load(std::sync::atomic::Ordering::SeqCst) => {
                 warn!("Ignoring FUSE operation after destroy: {}", self.request);
                 return Err(Errno::EIO);
             }
