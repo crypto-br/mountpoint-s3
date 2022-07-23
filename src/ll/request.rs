@@ -228,7 +228,7 @@ pub trait Request: Sized {
     fn pid(&self) -> u32;
 
     /// Create an error response for this Request
-    fn reply_err(&self, errno: Errno) -> Response {
+    fn reply_err(&self, errno: Errno) -> Response<'_> {
         Response::new_error(errno)
     }
 }
@@ -989,7 +989,7 @@ mod op {
                 #[cfg(feature = "abi-7-28")]
                 reserved: [0; 8],
             };
-            Response::new_data(init.as_bytes())
+            Response::new_owned_data(init.as_bytes())
         }
     }
 

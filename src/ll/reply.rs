@@ -18,13 +18,13 @@ const INLINE_DATA_THRESHOLD: usize = size_of::<u64>() * 4;
 pub(crate) type ResponseBuf = SmallVec<[u8; INLINE_DATA_THRESHOLD]>;
 
 #[derive(Debug)]
-pub enum Response {
+pub enum Response<'a> {
     Error(i32),
-    Data(ResponseBuf),
+    InlineData(ResponseBuf),
+    SliceData(&'a [u8]),
 }
 
-#[must_use]
-impl Response {
+impl<'a> Response<'a> {
     pub(crate) fn with_iovec<F: FnOnce(&[IoSlice<'_>]) -> T, T>(
         &self,
         unique: RequestId,
@@ -32,7 +32,8 @@ impl Response {
     ) -> T {
         let datalen = match &self {
             Response::Error(_) => 0,
-            Response::Data(v) => v.len(),
+            Response::InlineData(v) => v.len(),
+            Response::SliceData(v) => v.len(),
         };
         let header = abi::fuse_out_header {
             unique: unique.0,
@@ -48,7 +49,8 @@ impl Response {
         let mut v: SmallVec<[IoSlice<'_>; 3]> = smallvec![IoSlice::new(header.as_bytes())];
         match &self {
             Response::Error(_) => {}
-            Response::Data(d) => v.push(IoSlice::new(d.as_ref())),
+            Response::InlineData(d) => v.push(IoSlice::new(d.as_ref())),
+            Response::SliceData(d) => v.push(IoSlice::new(d.as_ref())),
         }
         f(&v)
     }
@@ -62,12 +64,12 @@ impl Response {
         Self::Error(error.into())
     }
 
-    pub(crate) fn new_data<T: AsRef<[u8]> + Into<Vec<u8>>>(data: T) -> Self {
-        Self::Data(if data.as_ref().len() <= INLINE_DATA_THRESHOLD {
-            data.as_ref().into()
-        } else {
-            data.into().into()
-        })
+    pub(crate) fn new_owned_data<T: AsRef<[u8]>>(data: T) -> Self {
+        Self::InlineData(data.as_ref().into())
+    }
+
+    pub(crate) fn new_data(data: &'a [u8]) -> Self {
+        Self::SliceData(data)
     }
 
     pub(crate) fn new_entry(
@@ -216,12 +218,12 @@ impl Response {
         for x in data {
             v.extend_from_slice(x)
         }
-        Self::Data(v)
+        Self::InlineData(v)
     }
 
     fn new_directory(list: EntListBuf) -> Self {
         assert!(list.buf.len() <= list.max_size);
-        Self::Data(list.buf)
+        Self::InlineData(list.buf)
     }
 
     pub(crate) fn new_xattr_size(size: u32) -> Self {
@@ -235,7 +237,7 @@ impl Response {
     }
 
     fn from_struct<T: AsBytes + ?Sized>(data: &T) -> Self {
-        Self::Data(data.as_bytes().into())
+        Self::InlineData(data.as_bytes().into())
     }
 }
 
@@ -382,7 +384,7 @@ impl<T: AsRef<Path>> DirEntry<T> {
 /// Used to respond to [ReadDirPlus] requests.
 #[derive(Debug)]
 pub struct DirEntList(EntListBuf);
-impl From<DirEntList> for Response {
+impl From<DirEntList> for Response<'_> {
     fn from(l: DirEntList) -> Self {
         assert!(l.0.buf.len() <= l.0.max_size);
         Response::new_directory(l.0)
@@ -411,6 +413,7 @@ impl DirEntList {
 
 #[derive(Debug)]
 pub struct DirEntryPlus<T: AsRef<Path>> {
+    #[allow(unused)]
     ino: INodeNo,
     generation: Generation,
     offset: DirEntOffset,
@@ -445,7 +448,7 @@ impl<T: AsRef<Path>> DirEntryPlus<T> {
 /// Used to respond to [ReadDir] requests.
 #[derive(Debug)]
 pub struct DirEntPlusList(EntListBuf);
-impl From<DirEntPlusList> for Response {
+impl From<DirEntPlusList> for Response<'_> {
     fn from(l: DirEntPlusList) -> Self {
         assert!(l.0.buf.len() <= l.0.max_size);
         Response::new_directory(l.0)
@@ -855,7 +858,7 @@ mod test {
             FileType::RegularFile,
             "world.rs"
         )));
-        let r: Response = buf.into();
+        let r: Response<'_> = buf.into();
         assert_eq!(
             r.with_iovec(RequestId(0xdeadbeef), ioslice_to_vec),
             expected
