@@ -1,6 +1,6 @@
 [package]
 name = "fuser"
-edition = "2018"
+edition = "2021"
 version = "0.11.0"
 authors = ["Christopher Berner <christopherberner@gmail.com>"]
 description = "Filesystem in Userspace (FUSE) for Rust"
@@ -17,6 +17,7 @@ license = "MIT"
 travis-ci = { repository = "cberner/fuser" }
 
 [dependencies]
+async-trait = "0.1.56"
 libc = "0.2.51"
 log = "0.4.6"
 memchr = "2"
@@ -24,6 +25,7 @@ users = "0.11.0"
 page_size = "0.4.2"
 serde = { version = "1.0.102", features = ["std", "derive"], optional = true }
 smallvec = "1.6.1"
+tokio = { version = "*", features = ["rt"] }
 zerocopy = "0.6"
 
 [dev-dependencies]
@@ -32,6 +34,7 @@ clap = { version = "3.0", features = ["cargo"] }
 bincode = "1.3.1"
 serde = { version = "1.0.102", features = ["std", "derive"] }
 tempfile = "3"
+tokio = { version = "*", features = ["full"] }
 
 [build-dependencies]
 pkg-config = { version = "0.3.14", optional = true }

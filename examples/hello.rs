@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use clap::{crate_version, Arg, Command};
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
@@ -49,8 +50,9 @@ const HELLO_TXT_ATTR: FileAttr = FileAttr {
 
 struct HelloFS;
 
+#[async_trait]
 impl Filesystem for HelloFS {
-    fn lookup(&self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    async fn lookup(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         if parent == 1 && name.to_str() == Some("hello.txt") {
             reply.entry(&TTL, &HELLO_TXT_ATTR, 0);
         } else {
@@ -58,7 +60,7 @@ impl Filesystem for HelloFS {
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    async fn getattr(&self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         match ino {
             1 => reply.attr(&TTL, &HELLO_DIR_ATTR),
             2 => reply.attr(&TTL, &HELLO_TXT_ATTR),
@@ -66,9 +68,9 @@ impl Filesystem for HelloFS {
         }
     }
 
-    fn read(
+    async fn read(
         &self,
-        _req: &Request,
+        _req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -84,7 +86,7 @@ impl Filesystem for HelloFS {
         }
     }
 
-    fn readdir(&self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    async fn readdir(&self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
         if ino != 1 {
             reply.error(ENOENT);
             return;
@@ -106,7 +108,8 @@ impl Filesystem for HelloFS {
     }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let matches = Command::new("hello")
         .version(crate_version!())
         .author("Christopher Berner")
@@ -136,5 +139,5 @@ fn main() {
     if matches.is_present("allow-root") {
         options.push(MountOption::AllowRoot);
     }
-    fuser::mount2(HelloFS, mountpoint, &options).unwrap();
+    fuser::mount2(HelloFS, mountpoint, &options).await.unwrap();
 }

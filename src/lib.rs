@@ -18,6 +18,7 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::{convert::AsRef, io::ErrorKind};
+use async_trait::async_trait;
 
 use crate::ll::fuse_abi::consts::*;
 pub use crate::ll::fuse_abi::FUSE_ROOT_ID;
@@ -42,6 +43,7 @@ use std::cmp::max;
 #[cfg(feature = "abi-7-13")]
 use std::cmp::min;
 
+mod async_runtime;
 mod channel;
 mod ll;
 mod mnt;
@@ -285,11 +287,12 @@ impl KernelConfig {
 /// implementations are provided here to get a mountable filesystem that does
 /// nothing.
 #[allow(clippy::too_many_arguments)]
+#[async_trait]
 pub trait Filesystem {
     /// Initialize filesystem.
     /// Called before any other filesystem method.
     /// The kernel module connection can be configured using the KernelConfig object
-    fn init(&self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
+    async fn init(&self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
         Ok(())
     }
 
@@ -298,7 +301,7 @@ pub trait Filesystem {
     fn destroy(&self) {}
 
     /// Look up a directory entry by name and get its attributes.
-    fn lookup(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    async fn lookup(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         warn!(
             "[Not Implemented] lookup(parent: {:#x?}, name {:?})",
             parent, name
@@ -313,25 +316,25 @@ pub trait Filesystem {
     /// each forget. The filesystem may ignore forget calls, if the inodes don't need to
     /// have a limited lifetime. On unmount it is not guaranteed, that all referenced
     /// inodes will receive a forget message.
-    fn forget(&self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
+    async fn forget(&self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
 
     /// Like forget, but take multiple forget requests at once for performance. The default
     /// implementation will fallback to forget.
     #[cfg(feature = "abi-7-16")]
-    fn batch_forget(&self, req: &Request<'_>, nodes: &[fuse_forget_one]) {
+    async fn batch_forget(&self, req: &Request<'_>, nodes: &[fuse_forget_one]) {
         for node in nodes {
             self.forget(req, node.nodeid, node.nlookup);
         }
     }
 
     /// Get file attributes.
-    fn getattr(&self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+    async fn getattr(&self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         warn!("[Not Implemented] getattr(ino: {:#x?})", ino);
         reply.error(ENOSYS);
     }
 
     /// Set file attributes.
-    fn setattr(
+    async fn setattr(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -358,14 +361,14 @@ pub trait Filesystem {
     }
 
     /// Read symbolic link.
-    fn readlink(&self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    async fn readlink(&self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
         debug!("[Not Implemented] readlink(ino: {:#x?})", ino);
         reply.error(ENOSYS);
     }
 
     /// Create file node.
     /// Create a regular file, character device, block device, fifo or socket node.
-    fn mknod(
+    async fn mknod(
         &self,
         _req: &Request<'_>,
         parent: u64,
@@ -384,7 +387,7 @@ pub trait Filesystem {
     }
 
     /// Create a directory.
-    fn mkdir(
+    async fn mkdir(
         &self,
         _req: &Request<'_>,
         parent: u64,
@@ -401,7 +404,7 @@ pub trait Filesystem {
     }
 
     /// Remove a file.
-    fn unlink(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    async fn unlink(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!(
             "[Not Implemented] unlink(parent: {:#x?}, name: {:?})",
             parent, name,
@@ -410,7 +413,7 @@ pub trait Filesystem {
     }
 
     /// Remove a directory.
-    fn rmdir(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    async fn rmdir(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!(
             "[Not Implemented] rmdir(parent: {:#x?}, name: {:?})",
             parent, name,
@@ -419,7 +422,7 @@ pub trait Filesystem {
     }
 
     /// Create a symbolic link.
-    fn symlink(
+    async fn symlink(
         &self,
         _req: &Request<'_>,
         parent: u64,
@@ -435,7 +438,7 @@ pub trait Filesystem {
     }
 
     /// Rename a file.
-    fn rename(
+    async fn rename(
         &self,
         _req: &Request<'_>,
         parent: u64,
@@ -454,7 +457,7 @@ pub trait Filesystem {
     }
 
     /// Create a hard link.
-    fn link(
+    async fn link(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -477,7 +480,7 @@ pub trait Filesystem {
     /// anything in fh. There are also some flags (direct_io, keep_cache) which the
     /// filesystem may set, to change the way the file is opened. See fuse_file_info
     /// structure in <fuse_common.h> for more details.
-    fn open(&self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+    async fn open(&self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
         reply.opened(0, 0);
     }
 
@@ -491,7 +494,7 @@ pub trait Filesystem {
     ///
     /// flags: these are the file flags, such as O_SYNC. Only supported with ABI >= 7.9
     /// lock_owner: only supported with ABI >= 7.9
-    fn read(
+    async fn read(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -522,7 +525,7 @@ pub trait Filesystem {
     /// is disabled
     /// flags: these are the file flags, such as O_SYNC. Only supported with ABI >= 7.9
     /// lock_owner: only supported with ABI >= 7.9
-    fn write(
+    async fn write(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -558,7 +561,7 @@ pub trait Filesystem {
     /// is not forced to flush pending writes. One reason to flush data, is if the
     /// filesystem wants to return write errors. If the filesystem supports file locking
     /// operations (setlk, getlk) it should remove all locks belonging to 'lock_owner'.
-    fn flush(&self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+    async fn flush(&self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
         debug!(
             "[Not Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
             ino, fh, lock_owner
@@ -574,7 +577,7 @@ pub trait Filesystem {
     /// the release. fh will contain the value set by the open method, or will be undefined
     /// if the open method didn't set any value. flags will contain the same flags as for
     /// open.
-    fn release(
+    async fn release(
         &self,
         _req: &Request<'_>,
         _ino: u64,
@@ -590,7 +593,7 @@ pub trait Filesystem {
     /// Synchronize file contents.
     /// If the datasync parameter is non-zero, then only the user data should be flushed,
     /// not the meta data.
-    fn fsync(&self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    async fn fsync(&self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         debug!(
             "[Not Implemented] fsync(ino: {:#x?}, fh: {}, datasync: {})",
             ino, fh, datasync
@@ -605,7 +608,7 @@ pub trait Filesystem {
     /// anything in fh, though that makes it impossible to implement standard conforming
     /// directory stream operations in case the contents of the directory can change
     /// between opendir and releasedir.
-    fn opendir(&self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
+    async fn opendir(&self, _req: &Request<'_>, _ino: u64, _flags: i32, reply: ReplyOpen) {
         reply.opened(0, 0);
     }
 
@@ -614,7 +617,7 @@ pub trait Filesystem {
     /// requested size. Send an empty buffer on end of stream. fh will contain the
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
-    fn readdir(&self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
+    async fn readdir(&self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, reply: ReplyDirectory) {
         warn!(
             "[Not Implemented] readdir(ino: {:#x?}, fh: {}, offset: {})",
             ino, fh, offset
@@ -627,7 +630,7 @@ pub trait Filesystem {
     /// requested size. Send an empty buffer on end of stream. fh will contain the
     /// value set by the opendir method, or will be undefined if the opendir method
     /// didn't set any value.
-    fn readdirplus(
+    async fn readdirplus(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -646,7 +649,7 @@ pub trait Filesystem {
     /// For every opendir call there will be exactly one releasedir call. fh will
     /// contain the value set by the opendir method, or will be undefined if the
     /// opendir method didn't set any value.
-    fn releasedir(&self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
+    async fn releasedir(&self, _req: &Request<'_>, _ino: u64, _fh: u64, _flags: i32, reply: ReplyEmpty) {
         reply.ok();
     }
 
@@ -654,7 +657,7 @@ pub trait Filesystem {
     /// If the datasync parameter is set, then only the directory contents should
     /// be flushed, not the meta data. fh will contain the value set by the opendir
     /// method, or will be undefined if the opendir method didn't set any value.
-    fn fsyncdir(&self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    async fn fsyncdir(&self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
         debug!(
             "[Not Implemented] fsyncdir(ino: {:#x?}, fh: {}, datasync: {})",
             ino, fh, datasync
@@ -663,12 +666,12 @@ pub trait Filesystem {
     }
 
     /// Get file system statistics.
-    fn statfs(&self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+    async fn statfs(&self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
     }
 
     /// Set an extended attribute.
-    fn setxattr(
+    async fn setxattr(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -689,7 +692,7 @@ pub trait Filesystem {
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
-    fn getxattr(&self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+    async fn getxattr(&self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
         debug!(
             "[Not Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
             ino, name, size
@@ -701,7 +704,7 @@ pub trait Filesystem {
     /// If `size` is 0, the size of the value should be sent with `reply.size()`.
     /// If `size` is not 0, and the value fits, send it with `reply.data()`, or
     /// `reply.error(ERANGE)` if it doesn't.
-    fn listxattr(&self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+    async fn listxattr(&self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
         debug!(
             "[Not Implemented] listxattr(ino: {:#x?}, size: {})",
             ino, size
@@ -710,7 +713,7 @@ pub trait Filesystem {
     }
 
     /// Remove an extended attribute.
-    fn removexattr(&self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    async fn removexattr(&self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
         debug!(
             "[Not Implemented] removexattr(ino: {:#x?}, name: {:?})",
             ino, name
@@ -722,7 +725,7 @@ pub trait Filesystem {
     /// This will be called for the access() system call. If the 'default_permissions'
     /// mount option is given, this method is not called. This method is not called
     /// under Linux kernel versions 2.4.x
-    fn access(&self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
+    async fn access(&self, _req: &Request<'_>, ino: u64, mask: i32, reply: ReplyEmpty) {
         debug!("[Not Implemented] access(ino: {:#x?}, mask: {})", ino, mask);
         reply.error(ENOSYS);
     }
@@ -737,7 +740,7 @@ pub trait Filesystem {
     /// structure in <fuse_common.h> for more details. If this method is not
     /// implemented or under Linux kernel versions earlier than 2.6.15, the mknod()
     /// and open() methods will be called instead.
-    fn create(
+    async fn create(
         &self,
         _req: &Request<'_>,
         parent: u64,
@@ -756,7 +759,7 @@ pub trait Filesystem {
     }
 
     /// Test for a POSIX file lock.
-    fn getlk(
+    async fn getlk(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -783,7 +786,7 @@ pub trait Filesystem {
     /// used to fill in this field in getlk(). Note: if the locking methods are not
     /// implemented, the kernel will still allow file locking to work locally.
     /// Hence these are only interesting for network filesystems and similar.
-    fn setlk(
+    async fn setlk(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -807,7 +810,7 @@ pub trait Filesystem {
     /// Map block index within file to block index within device.
     /// Note: This makes sense only for block device backed filesystems mounted
     /// with the 'blkdev' option
-    fn bmap(&self, _req: &Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: ReplyBmap) {
+    async fn bmap(&self, _req: &Request<'_>, ino: u64, blocksize: u32, idx: u64, reply: ReplyBmap) {
         debug!(
             "[Not Implemented] bmap(ino: {:#x?}, blocksize: {}, idx: {})",
             ino, blocksize, idx,
@@ -816,7 +819,7 @@ pub trait Filesystem {
     }
 
     /// control device
-    fn ioctl(
+    async fn ioctl(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -841,7 +844,7 @@ pub trait Filesystem {
     }
 
     /// Preallocate or deallocate space to a file
-    fn fallocate(
+    async fn fallocate(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -860,7 +863,7 @@ pub trait Filesystem {
     }
 
     /// Reposition read/write file offset
-    fn lseek(
+    async fn lseek(
         &self,
         _req: &Request<'_>,
         ino: u64,
@@ -877,7 +880,7 @@ pub trait Filesystem {
     }
 
     /// Copy the specified range from the source inode to the destination inode
-    fn copy_file_range(
+    async fn copy_file_range(
         &self,
         _req: &Request<'_>,
         ino_in: u64,
@@ -902,14 +905,14 @@ pub trait Filesystem {
     /// macOS only: Rename the volume. Set fuse_init_out.flags during init to
     /// FUSE_VOL_RENAME to enable
     #[cfg(target_os = "macos")]
-    fn setvolname(&self, _req: &Request<'_>, name: &OsStr, reply: ReplyEmpty) {
+    async fn setvolname(&self, _req: &Request<'_>, name: &OsStr, reply: ReplyEmpty) {
         debug!("[Not Implemented] setvolname(name: {:?})", name);
         reply.error(ENOSYS);
     }
 
     /// macOS only (undocumented)
     #[cfg(target_os = "macos")]
-    fn exchange(
+    async fn exchange(
         &self,
         _req: &Request<'_>,
         parent: u64,
@@ -930,7 +933,7 @@ pub trait Filesystem {
     /// macOS only: Query extended times (bkuptime and crtime). Set fuse_init_out.flags
     /// during init to FUSE_XTIMES to enable
     #[cfg(target_os = "macos")]
-    fn getxtimes(&self, _req: &Request<'_>, ino: u64, reply: ReplyXTimes) {
+    async fn getxtimes(&self, _req: &Request<'_>, ino: u64, reply: ReplyXTimes) {
         debug!("[Not Implemented] getxtimes(ino: {:#x?})", ino);
         reply.error(ENOSYS);
     }
@@ -942,7 +945,7 @@ pub trait Filesystem {
 /// Note that you need to lead each option with a separate `"-o"` string. See
 /// `examples/hello.rs`.
 #[deprecated(note = "use mount2() instead")]
-pub fn mount<FS: Filesystem, P: AsRef<Path>>(
+pub fn mount<FS: Filesystem + Send + Sync + 'static, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[&OsStr],
@@ -955,13 +958,14 @@ pub fn mount<FS: Filesystem, P: AsRef<Path>>(
 /// not return until the filesystem is unmounted.
 ///
 /// NOTE: This will eventually replace mount(), once the API is stable
-pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
+pub fn mount2<FS: Filesystem + Send + Sync + 'static, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[MountOption],
 ) -> io::Result<()> {
     check_option_conflicts(options)?;
-    Session::new(filesystem, mountpoint.as_ref(), options).and_then(|se| se.run())
+    let session = Session::new(filesystem, mountpoint.as_ref(), options)?;
+    session.run()
 }
 
 /// Mount the given filesystem to the given mountpoint. This function spawns
@@ -970,7 +974,7 @@ pub fn mount2<FS: Filesystem, P: AsRef<Path>>(
 /// to reference the mounted filesystem. If it's dropped, the filesystem will
 /// be unmounted.
 #[deprecated(note = "use spawn_mount2() instead")]
-pub fn spawn_mount<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
+pub fn spawn_mount<'a, FS: Filesystem + Send + Sync + 'static + 'a, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[&OsStr],
@@ -990,7 +994,7 @@ pub fn spawn_mount<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
 /// be unmounted.
 ///
 /// NOTE: This is the corresponding function to mount2.
-pub fn spawn_mount2<'a, FS: Filesystem + Send + 'static + 'a, P: AsRef<Path>>(
+pub fn spawn_mount2<'a, FS: Filesystem + Send + Sync + 'static + 'a, P: AsRef<Path>>(
     filesystem: FS,
     mountpoint: P,
     options: &[MountOption],
