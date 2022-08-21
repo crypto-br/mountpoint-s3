@@ -17,7 +17,7 @@ use crate::ll::Request as _;
 #[cfg(feature = "abi-7-21")]
 use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplySender};
-use crate::session::{Session, SessionACL};
+use crate::session::{Session, SessionACL, aligned_sub_buf};
 use crate::Filesystem;
 use crate::{ll, KernelConfig};
 
@@ -26,17 +26,29 @@ use crate::{ll, KernelConfig};
 pub struct Request<'a> {
     /// Channel sender for sending the reply
     ch: ChannelSender,
-    /// Request raw data
-    #[allow(unused)]
-    data: &'a [u8],
     /// Parsed request
     request: ll::AnyRequest<'a>,
+    /// Request raw data
+    #[allow(unused)]
+    data: Vec<u8>,
+}
+
+unsafe fn extend_lifetime<'old, 'new: 'old, T: 'new + ?Sized>(data: &'old T) -> &'new T {
+    &*(data as *const _)
 }
 
 impl<'a> Request<'a> {
     /// Create a new request from the given data
-    pub(crate) fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
-        let request = match ll::AnyRequest::try_from(data) {
+    pub(crate) fn new(ch: ChannelSender, data: Vec<u8>) -> Option<Request<'a>> {
+        let slice = &data[..];
+        // TODO safety -- basically this can't outlive the `data` because `self.request` gets
+        // dropped first.
+        let slice: &'a [u8] = unsafe { extend_lifetime(slice) };
+        let slice = aligned_sub_buf(
+            &slice[..],
+            std::mem::align_of::<abi::fuse_in_header>(),
+        );
+        let request = match ll::AnyRequest::try_from(slice) {
             Ok(request) => request,
             Err(err) => {
                 error!("{}", err);

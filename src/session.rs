@@ -114,21 +114,27 @@ impl<FS: Filesystem + Send + Sync> Session<FS> {
     /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
     /// having multiple buffers (which take up much memory), but the filesystem methods
     /// may run concurrent by spawning threads.
-    pub fn run(self) -> io::Result<()> {
-        // Buffer for receiving requests from the kernel. Only one is allocated and
-        // it is reused immediately after dispatching to conserve memory and allocations.
-        let mut buffer = vec![0; BUFFER_SIZE];
-        let buf = aligned_sub_buf(
-            buffer.deref_mut(),
-            std::mem::align_of::<abi::fuse_in_header>(),
-        );
+    pub fn run(self) -> io::Result<()>
+    where
+        FS: 'static
+    {
+        let session = std::sync::Arc::new(self);
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(buf) {
-                Ok(size) => match Request::new(self.ch.sender(), &buf[..size]) {
+            let mut buffer = vec![0; BUFFER_SIZE];
+            let buf = aligned_sub_buf_mut(
+                buffer.deref_mut(),
+                std::mem::align_of::<abi::fuse_in_header>(),
+            );
+            match session.ch.receive(buf) {
+                // TODO figure out the alignment stuff here ... need to chop `buffer` down to `size` + whatever padding came off the front
+                Ok(size) => match Request::new(session.ch.sender(), buffer) {
                     // Dispatch request
-                    Some(req) => { tokio::spawn(req.dispatch(&self)); }
+                    Some(req) => { 
+                        let session = std::sync::Arc::clone(&session);
+                        tokio::spawn(async move { req.dispatch(&*session).await });
+                    }
                     // Quit loop on illegal request
                     None => break,
                 },
@@ -155,7 +161,16 @@ impl<FS: Filesystem + Send + Sync> Session<FS> {
     }
 }
 
-fn aligned_sub_buf(buf: &mut [u8], alignment: usize) -> &mut [u8] {
+pub(crate) fn aligned_sub_buf(buf: &[u8], alignment: usize) -> &[u8] {
+    let off = alignment - (buf.as_ptr() as usize) % alignment;
+    if off == alignment {
+        buf
+    } else {
+        &buf[off..]
+    }
+}
+
+pub(crate) fn aligned_sub_buf_mut(buf: &mut [u8], alignment: usize) -> &mut [u8] {
     let off = alignment - (buf.as_ptr() as usize) % alignment;
     if off == alignment {
         buf
@@ -187,7 +202,7 @@ pub struct BackgroundSession {
     /// Path of the mounted filesystem
     pub mountpoint: PathBuf,
     /// Thread guard of the background session
-    pub guards: Vec<tokio::task::JoinHandle<io::Result<()>>>,
+    pub guard: tokio::task::JoinHandle<io::Result<()>>,
     /// Ensures the filesystem is unmounted when the session ends
     _mount: Mount,
 }
@@ -206,7 +221,7 @@ impl BackgroundSession {
         let guard = tokio::task::spawn_blocking(move || se.run());
         Ok(BackgroundSession {
             mountpoint,
-            guards: vec![guard],
+            guard,
             _mount: mount,
         })
     }
@@ -239,13 +254,11 @@ impl BackgroundSession {
     pub async fn join(self) {
         let Self {
             mountpoint: _,
-            guards,
+            guard,
             _mount,
         } = self;
         drop(_mount);
-        for guard in guards {
-            guard.await.unwrap().unwrap();
-        }
+        guard.await.unwrap().unwrap();
     }
 }
 
