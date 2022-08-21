@@ -119,10 +119,11 @@ impl<FS: Filesystem + Send + Sync> Session<FS> {
         FS: 'static
     {
         let session = std::sync::Arc::new(self);
+        let buffer_pool = BufferPool::new();
         loop {
             // Read the next request from the given channel to kernel driver
             // The kernel driver makes sure that we get exactly one request per read
-            let mut buffer = vec![0; BUFFER_SIZE];
+            let mut buffer = buffer_pool.allocate();
             let buf = aligned_sub_buf_mut(
                 buffer.deref_mut(),
                 std::mem::align_of::<abi::fuse_in_header>(),
@@ -158,6 +159,61 @@ impl<FS: Filesystem + Send + Sync> Session<FS> {
     /// Unmount the filesystem
     pub fn unmount(&mut self) {
         drop(std::mem::take(&mut self.mount));
+    }
+}
+
+struct BufferPool {
+    recv: crossbeam::channel::Receiver<Vec<u8>>,
+    send: crossbeam::channel::Sender<Vec<u8>>,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        let (send, recv) = crossbeam::channel::unbounded();
+        Self {
+            recv,
+            send,
+        }
+    }
+
+    fn allocate(&self) -> BufferPoolToken {
+        let buf = match self.recv.try_recv() {
+            Ok(buf) => buf,
+            Err(crossbeam::channel::TryRecvError::Empty) => vec![0; BUFFER_SIZE],
+            Err(crossbeam::channel::TryRecvError::Disconnected) => unreachable!(),
+        };
+
+        BufferPoolToken {
+            data: Some(buf),
+            returner: self.send.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BufferPoolToken {
+    data: Option<Vec<u8>>,
+    returner: crossbeam::channel::Sender<Vec<u8>>,
+}
+
+impl std::ops::Deref for BufferPoolToken {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.data.as_ref().unwrap()[..]
+    }
+}
+
+impl std::ops::DerefMut for BufferPoolToken {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.data.as_mut().unwrap()[..]
+    }
+}
+
+impl Drop for BufferPoolToken {
+    fn drop(&mut self) {
+        let buf = self.data.take().unwrap();
+        let _ = self.returner.send(buf);
     }
 }
 

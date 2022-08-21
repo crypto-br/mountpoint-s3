@@ -17,7 +17,7 @@ use crate::ll::Request as _;
 #[cfg(feature = "abi-7-21")]
 use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplySender};
-use crate::session::{Session, SessionACL, aligned_sub_buf};
+use crate::session::{Session, SessionACL, aligned_sub_buf, BufferPoolToken};
 use crate::Filesystem;
 use crate::{ll, KernelConfig};
 
@@ -30,7 +30,7 @@ pub struct Request<'a> {
     request: ll::AnyRequest<'a>,
     /// Request raw data
     #[allow(unused)]
-    data: Vec<u8>,
+    data: BufferPoolToken,
 }
 
 unsafe fn extend_lifetime<'old, 'new: 'old, T: 'new + ?Sized>(data: &'old T) -> &'new T {
@@ -39,7 +39,7 @@ unsafe fn extend_lifetime<'old, 'new: 'old, T: 'new + ?Sized>(data: &'old T) -> 
 
 impl<'a> Request<'a> {
     /// Create a new request from the given data
-    pub(crate) fn new(ch: ChannelSender, data: Vec<u8>) -> Option<Request<'a>> {
+    pub(crate) fn new(ch: ChannelSender, data: BufferPoolToken) -> Option<Request<'a>> {
         let slice = &data[..];
         // TODO safety -- basically this can't outlive the `data` because `self.request` gets
         // dropped first.

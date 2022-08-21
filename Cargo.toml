@@ -18,6 +18,7 @@ travis-ci = { repository = "cberner/fuser" }
 
 [dependencies]
 async-trait = "0.1.56"
+crossbeam = "*"
 libc = "0.2.51"
 log = "0.4.6"
 memchr = "2"
