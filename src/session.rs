@@ -9,6 +9,8 @@ use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{info, warn};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
 use std::{io, ops::DerefMut};
 
 use crate::ll::fuse_abi as abi;
@@ -114,11 +116,11 @@ impl<FS: Filesystem + Send + Sync> Session<FS> {
     /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
     /// having multiple buffers (which take up much memory), but the filesystem methods
     /// may run concurrent by spawning threads.
-    pub fn run(self) -> io::Result<()>
+    pub fn run(self: Arc<Self>) -> io::Result<()>
     where
-        FS: 'static
+        FS: 'static,
     {
-        let session = std::sync::Arc::new(self);
+        let session = self;
         let buffer_pool = BufferPool::new();
         loop {
             // Read the next request from the given channel to kernel driver
@@ -130,11 +132,11 @@ impl<FS: Filesystem + Send + Sync> Session<FS> {
             );
             match session.ch.receive(buf) {
                 // TODO figure out the alignment stuff here ... need to chop `buffer` down to `size` + whatever padding came off the front
-                Ok(size) => match Request::new(session.ch.sender(), buffer) {
+                Ok(_size) => match Request::new(session.ch.sender(), buffer) {
                     // Dispatch request
-                    Some(req) => { 
+                    Some(req) => {
                         let session = std::sync::Arc::clone(&session);
-                        tokio::spawn(async move { req.dispatch(&*session).await });
+                        futures::executor::block_on(async move { req.dispatch(&*session).await });
                     }
                     // Quit loop on illegal request
                     None => break,
@@ -170,10 +172,7 @@ struct BufferPool {
 impl BufferPool {
     fn new() -> Self {
         let (send, recv) = crossbeam::channel::unbounded();
-        Self {
-            recv,
-            send,
-        }
+        Self { recv, send }
     }
 
     fn allocate(&self) -> BufferPoolToken {
@@ -258,7 +257,7 @@ pub struct BackgroundSession {
     /// Path of the mounted filesystem
     pub mountpoint: PathBuf,
     /// Thread guard of the background session
-    pub guard: tokio::task::JoinHandle<io::Result<()>>,
+    pub guards: Vec<JoinHandle<io::Result<()>>>,
     /// Ensures the filesystem is unmounted when the session ends
     _mount: Mount,
 }
@@ -274,47 +273,50 @@ impl BackgroundSession {
         // Take the fuse_session, so that we can unmount it
         let mount = std::mem::take(&mut se.mount);
         let mount = mount.ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
-        let guard = tokio::task::spawn_blocking(move || se.run());
+        let se = Arc::new(se);
+        let guard = thread::spawn(move || se.run());
         Ok(BackgroundSession {
             mountpoint,
-            guard,
+            guards: vec![guard],
             _mount: mount,
         })
     }
 
-    // /// Like `new` but multithreaded
-    // pub fn new_multi_thread<FS: Filesystem + Send + Sync + 'static>(
-    //     mut se: Session<FS>,
-    //     thread_count: usize,
-    // ) -> io::Result<BackgroundSession> {
-    //     assert!(thread_count >= 1);
-    //     let mountpoint = se.mountpoint().to_path_buf();
-    //     // Take the fuse_session, so that we can unmount it
-    //     let mount = std::mem::take(&mut se.mount);
-    //     let mount = mount.ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
-    //     let se = Arc::new(se);
-    //     let guards = (0..thread_count)
-    //         .map(|_| {
-    //             let se = Arc::clone(&se);
-    //             thread::spawn(move || se.run())
-    //         })
-    //         .collect();
-    //     Ok(BackgroundSession {
-    //         mountpoint,
-    //         guards,
-    //         _mount: mount,
-    //     })
-    // }
+    /// Like `new` but multithreaded
+    pub fn new_multi_thread<FS: Filesystem + Send + Sync + 'static>(
+        mut se: Session<FS>,
+        thread_count: usize,
+    ) -> io::Result<BackgroundSession> {
+        assert!(thread_count >= 1);
+        let mountpoint = se.mountpoint().to_path_buf();
+        // Take the fuse_session, so that we can unmount it
+        let mount = std::mem::take(&mut se.mount);
+        let mount = mount.ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))?;
+        let se = Arc::new(se);
+        let guards = (0..thread_count)
+            .map(|_| {
+                let se = Arc::clone(&se);
+                thread::spawn(move || se.run())
+            })
+            .collect();
+        Ok(BackgroundSession {
+            mountpoint,
+            guards,
+            _mount: mount,
+        })
+    }
 
     /// Unmount the filesystem and join the background thread.
     pub async fn join(self) {
         let Self {
             mountpoint: _,
-            guard,
+            guards,
             _mount,
         } = self;
         drop(_mount);
-        guard.await.unwrap().unwrap();
+        for guard in guards {
+            guard.join().unwrap().unwrap();
+        }
     }
 }
 
