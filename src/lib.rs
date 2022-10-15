@@ -323,7 +323,7 @@ pub trait Filesystem {
     #[cfg(feature = "abi-7-16")]
     async fn batch_forget(&self, req: &Request<'_>, nodes: &[fuse_forget_one]) {
         for node in nodes {
-            self.forget(req, node.nodeid, node.nlookup);
+            self.forget(req, node.nodeid, node.nlookup).await;
         }
     }
 
