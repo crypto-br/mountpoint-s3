@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -334,7 +334,7 @@ impl ObjectClient for S3Client {
         bucket: &str,
         key: &str,
         params: &PutObjectParams,
-        contents: impl futures::Stream<Item = impl Deref<Target = [u8]> + Send> + Send,
+        contents: impl futures::Stream<Item = impl AsRef<[u8]> + Send> + Send,
     ) -> Result<PutObjectResult, Self::PutObjectError> {
         self.put_object(bucket, key, params, contents).await
     }

@@ -5,7 +5,6 @@ use aws_crt_s3::http::request_response::{Header, Message};
 use aws_crt_s3::io::stream::InputStream;
 use aws_crt_s3::s3::client::MetaRequestType;
 use futures::{Stream, StreamExt};
-use std::ops::Deref;
 use thiserror::Error;
 use tracing::debug;
 
@@ -19,7 +18,7 @@ impl S3Client {
         bucket: &str,
         key: &str,
         _params: &PutObjectParams,
-        contents: impl Stream<Item = impl Deref<Target = [u8]> + Send> + Send,
+        contents: impl Stream<Item = impl AsRef<[u8]> + Send> + Send,
     ) -> Result<PutObjectResult, S3RequestError<PutObjectError>> {
         let mut buffer = vec![];
 

@@ -3,12 +3,73 @@
 use crate::common::{allocator::Allocator, error::Error};
 use crate::CrtError;
 use aws_crt_s3_sys::*;
+use futures::stream::BoxStream;
+use futures::{Stream, StreamExt};
+use std::collections::VecDeque;
 use std::ffi::CString;
+use std::fmt::Debug;
+use std::io::{Cursor, Read};
 use std::marker::PhantomData;
 use std::os::unix::prelude::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
+use super::futures::FutureSpawner;
+
+/// Status of an [InputStream].
+#[derive(Debug)]
+pub struct StreamStatus {
+    is_valid: bool,
+    is_end_of_stream: bool,
+}
+
+impl From<aws_stream_status> for StreamStatus {
+    fn from(status: aws_stream_status) -> Self {
+        Self {
+            is_valid: status.is_valid,
+            is_end_of_stream: status.is_end_of_stream,
+        }
+    }
+}
+
+impl From<StreamStatus> for aws_stream_status {
+    fn from(status: StreamStatus) -> Self {
+        Self {
+            is_valid: status.is_valid,
+            is_end_of_stream: status.is_end_of_stream,
+        }
+    }
+}
+
+/// Specifies where to seek from in an [InputStream].
+#[derive(Debug)]
+pub enum SeekBasis {
+    /// Seek from the beginning of the stream.
+    Begin,
+    /// Seek from the end of the stream.
+    End,
+}
+
+impl From<aws_stream_seek_basis> for SeekBasis {
+    fn from(value: aws_stream_seek_basis) -> Self {
+        match value {
+            aws_stream_seek_basis::AWS_SSB_BEGIN => Self::Begin,
+            aws_stream_seek_basis::AWS_SSB_END => Self::End,
+            _ => panic!("invalid stream seek basis: {:?}", value),
+        }
+    }
+}
+
+impl From<SeekBasis> for aws_stream_seek_basis {
+    fn from(value: SeekBasis) -> Self {
+        match value {
+            SeekBasis::Begin => aws_stream_seek_basis::AWS_SSB_BEGIN,
+            SeekBasis::End => aws_stream_seek_basis::AWS_SSB_END,
+        }
+    }
+}
 
 /// An [InputStream] is a way to read bytes. They can be obtained either from CRT functions,
 /// or by creating a new one based on a Rust type that implements the [GenericInputStream] trait.
@@ -115,13 +176,13 @@ impl<'a> Drop for InputStream<'a> {
 /// This allows Rust client code to define new ways of creating [InputStream]s.
 pub trait GenericInputStream {
     /// Seek to the given offset. Basis is either BEGIN or END, and describes where to seek from.
-    fn seek(&self, offset: i64, basis: aws_stream_seek_basis) -> Result<(), Error>;
+    fn seek(&mut self, offset: i64, basis: SeekBasis) -> Result<(), Error>;
 
     /// Read some data into `buffer`, and return how many bytes were read.
-    fn read(&self, buffer: &mut [u8]) -> Result<usize, Error>;
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Error>;
 
     /// Get the status of this stream. Can be used to indicate if stream is at the EOF.
-    fn get_status(&self) -> Result<aws_stream_status, Error>;
+    fn get_status(&self) -> Result<StreamStatus, Error>;
 
     /// Get the length of this input stream, in bytes. If a length cannot be determined, return Err.
     fn get_length(&self) -> Result<usize, Error>;
@@ -174,27 +235,30 @@ unsafe fn input_stream_to_generic_stream(stream: *mut aws_input_stream) -> *mut 
     generic_ptr
 }
 
-// Allow use of `enum aws_stream_seek_basis` in an extern function since it's only used in a
-// callback, and we trust the CRT to call this with proper values for the enum.
+// SAFETY: Only should be used as a CRT callback. The suppressed improper ctypes warning warns us that
+// aws_stream_seek_basis is not exhaustive and so the code is unsafe if the CRT passes us an invalid
+// value: we trust that the CRT does not.
 #[allow(improper_ctypes_definitions)]
 unsafe extern "C" fn generic_seek(stream: *mut aws_input_stream, offset: i64, basis: aws_stream_seek_basis) -> i32 {
-    let generic_stream = &*input_stream_to_generic_stream(stream);
+    let generic_stream = &mut *input_stream_to_generic_stream(stream);
 
-    match generic_stream.stream.seek(offset, basis) {
+    match generic_stream.stream.seek(offset, basis.into()) {
         Ok(()) => AWS_OP_SUCCESS,
         Err(err) => err.raise_error(),
     }
 }
 
+// SAFETY: Only should be used as a CRT callback.
 unsafe extern "C" fn generic_read(stream: *mut aws_input_stream, dest: *mut aws_byte_buf) -> i32 {
-    let generic_stream = &*input_stream_to_generic_stream(stream);
+    let generic_stream = &mut *input_stream_to_generic_stream(stream);
     let dest = dest.as_mut().expect("dest cannot be null");
 
     let buffer: &mut [u8] = if dest.capacity != 0 {
         assert!(!dest.buffer.is_null());
         std::slice::from_raw_parts_mut(dest.buffer, dest.capacity)
     } else {
-        // If the capacity is 0, we can't use from_raw_parts.
+        // It's tricky to use from_raw_parts with a size of 0 since the pointer must still be aligned.
+        // So instead just make an empty slice.
         &mut []
     };
 
@@ -217,12 +281,13 @@ unsafe extern "C" fn generic_read(stream: *mut aws_input_stream, dest: *mut aws_
     }
 }
 
+// SAFETY: Only should be used as a CRT callback.
 unsafe extern "C" fn generic_get_status(stream: *mut aws_input_stream, out_status: *mut aws_stream_status) -> i32 {
     let generic_stream = &*input_stream_to_generic_stream(stream);
 
     match generic_stream.stream.get_status() {
         Ok(status) => {
-            *out_status = status;
+            (*out_status) = status.into();
             AWS_OP_SUCCESS
         }
 
@@ -230,6 +295,7 @@ unsafe extern "C" fn generic_get_status(stream: *mut aws_input_stream, out_statu
     }
 }
 
+// SAFETY: Only should be used as a CRT callback.
 unsafe extern "C" fn generic_get_length(stream: *mut aws_input_stream, out_length: *mut i64) -> i32 {
     let generic_stream = &*input_stream_to_generic_stream(stream);
 
@@ -242,6 +308,7 @@ unsafe extern "C" fn generic_get_length(stream: *mut aws_input_stream, out_lengt
     }
 }
 
+// SAFETY: Only should be used as a CRT callback.
 unsafe extern "C" fn generic_acquire(stream: *mut aws_input_stream) {
     let generic_stream = input_stream_to_generic_stream(stream);
 
@@ -249,6 +316,7 @@ unsafe extern "C" fn generic_acquire(stream: *mut aws_input_stream) {
     Arc::increment_strong_count(generic_stream);
 }
 
+// SAFETY: Only should be used as a CRT callback.
 unsafe extern "C" fn generic_release(stream: *mut aws_input_stream) {
     let generic_stream = input_stream_to_generic_stream(stream);
 
@@ -257,15 +325,15 @@ unsafe extern "C" fn generic_release(stream: *mut aws_input_stream) {
     Arc::decrement_strong_count(generic_stream);
 }
 
-// We can implement [GenericInputStream] for [InputStream] so that we can use CRT-defined
-// input streams using a nice Rust interface.
+// We can implement [GenericInputStream] for [InputStream] so that we can use any CRT-implemented
+// input streams with the Rust trait-based interface.
 impl<'a> GenericInputStream for InputStream<'a> {
-    fn seek(&self, offset: i64, basis: aws_stream_seek_basis) -> Result<(), Error> {
+    fn seek(&mut self, offset: i64, basis: SeekBasis) -> Result<(), Error> {
         // SAFETY: self.inner is a valid input stream.
-        unsafe { aws_input_stream_seek(self.inner.as_ptr(), offset, basis).ok_or_last_error() }
+        unsafe { aws_input_stream_seek(self.inner.as_ptr(), offset, basis.into()).ok_or_last_error() }
     }
 
-    fn read(&self, buffer: &mut [u8]) -> Result<usize, Error> {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
         let mut byte_buf = aws_byte_buf {
             len: 0,
             buffer: buffer.as_mut_ptr(),
@@ -289,7 +357,7 @@ impl<'a> GenericInputStream for InputStream<'a> {
         Ok(byte_buf.len)
     }
 
-    fn get_status(&self) -> Result<aws_stream_status, Error> {
+    fn get_status(&self) -> Result<StreamStatus, Error> {
         let mut status: aws_stream_status = Default::default();
 
         // SAFETY: self.inner is a valid input stream and status is a local variable.
@@ -297,7 +365,7 @@ impl<'a> GenericInputStream for InputStream<'a> {
             aws_input_stream_get_status(self.inner.as_ptr(), &mut status).ok_or_last_error()?;
         }
 
-        Ok(status)
+        Ok(status.into())
     }
 
     fn get_length(&self) -> Result<usize, Error> {
@@ -312,10 +380,148 @@ impl<'a> GenericInputStream for InputStream<'a> {
     }
 }
 
+/// An [AsyncInputStream] wraps an implementation of [AsyncRead] into an implementation of
+/// [GenericInputStream], using a [FutureSpawner] (like an [EventLoop]) to handle background
+/// asynchronous tasks. Due to CRT limitations, the InputStream API currently has no way to notify
+/// the CRT when data becomes available. TODO: change that.
+pub struct AsyncInputStream<B, Spawner>
+where
+    B: AsRef<[u8]> + Send + 'static,
+    Spawner: FutureSpawner,
+{
+    /// A pointer to the inner implementor of [AsyncRead]. If it's None, that means we already have
+    /// a scheduled task to read from it.
+    stream_ptr: Arc<Mutex<Option<BoxStream<'static, B>>>>,
+
+    /// The method by which to spawn futures to await upon reads in.
+    spawner: Spawner,
+
+    /// A queue of available buffers that we can give to the CRT on request.
+    buffers: Arc<Mutex<VecDeque<Cursor<B>>>>,
+
+    finished: Arc<AtomicBool>,
+}
+
+impl<B, Spawner> Debug for AsyncInputStream<B, Spawner>
+where
+    B: AsRef<[u8]> + Send + 'static,
+    Spawner: FutureSpawner,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncInputStream").finish()
+    }
+}
+
+impl<B, Spawner> AsyncInputStream<B, Spawner>
+where
+    B: AsRef<[u8]> + Send + 'static,
+    Spawner: FutureSpawner,
+{
+    /// Create a new [AsyncInputStream] from an async stream that yields buffers.
+    pub fn new(spawner: Spawner, stream: impl Stream<Item = B> + Send + 'static) -> Self {
+        Self {
+            stream_ptr: Arc::new(Mutex::new(Some(stream.boxed()))),
+            spawner,
+            buffers: Default::default(),
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    // Schedule the buffers to be refilled. If a refill is already scheduled, or if the stream
+    // is done, does nothing.
+    fn schedule_refill(&self) {
+        // If the stream is present, schedule another refill asynchronously. Otherwise,
+        // there's either a concurrently running refill, or the stream is finished yielding elements.
+        if let Some(mut stream) = self.stream_ptr.lock().unwrap().take() {
+            let stream_ptr = Arc::clone(&self.stream_ptr);
+            let buffers = Arc::clone(&self.buffers);
+            let finished = Arc::clone(&self.finished);
+
+            // Spawn a future to read from the reader onto the scheduler (e.g., EventLoop).
+            self.spawner.spawn_future(async move {
+                if let Some(next_buffer) = stream.next().await {
+                    // Put the reader back so that refill() can work again. Do this before adding the new
+                    // buffer to prevent the case where there is no data left in the buffers, but refill()
+                    // won't work because we haven't put this back.
+                    stream_ptr.lock().unwrap().replace(stream);
+
+                    // Push the next buffer onto the queue of buffers.
+                    buffers.lock().unwrap().push_back(Cursor::new(next_buffer));
+
+                    // TODO: Notify the CRT with a callback that more data has arrived.
+                    // It is not possible to do so with the current aws_input_stream interface.
+                } else {
+                    finished.store(true, Ordering::SeqCst);
+                }
+            });
+        }
+    }
+}
+
+impl<B, Spawner> GenericInputStream for AsyncInputStream<B, Spawner>
+where
+    B: AsRef<[u8]> + Send + 'static,
+    Spawner: FutureSpawner + Sync,
+{
+    fn seek(&mut self, _offset: i64, _basis: SeekBasis) -> Result<(), Error> {
+        // Cannot support seeking within in async stream.
+        Err((aws_common_error::AWS_ERROR_UNSUPPORTED_OPERATION as i32).into())
+    }
+
+    fn read(&mut self, out_buffer: &mut [u8]) -> Result<usize, Error> {
+        let mut buffers = self.buffers.lock().unwrap();
+
+        let mut total_bytes_read = 0;
+
+        // Read as much as we can into the CRT buffer.
+        while total_bytes_read < out_buffer.len() {
+            // Grab the first buffer in the queue (if it exists).
+            if let Some(buffer) = buffers.get_mut(0) {
+                // Read as many new bytes as we can into out_buffer from the next cursor.
+                let bytes_read = buffer
+                    .read(&mut out_buffer[total_bytes_read..])
+                    .expect("read from Cursor should not fail");
+
+                // Until [Cursor::is_empty] is stable, check for EOF when read returns 0.
+                // Remove the cursor if it's empty.
+                if bytes_read == 0 {
+                    buffers.pop_front().unwrap();
+                }
+
+                total_bytes_read += bytes_read;
+            } else {
+                // No buffers left
+                break;
+            }
+        }
+
+        // If we weren't able to read anything, schedule a refill so that maybe next time CRT calls
+        // us we'll have data.
+        if total_bytes_read == 0 {
+            self.schedule_refill()
+        }
+
+        Ok(total_bytes_read)
+    }
+
+    fn get_status(&self) -> Result<StreamStatus, Error> {
+        Ok(StreamStatus {
+            is_valid: true,
+            is_end_of_stream: self.finished.load(Ordering::SeqCst),
+        })
+    }
+
+    fn get_length(&self) -> Result<usize, Error> {
+        // Cannot support getting the length of an async stream.
+        Err((aws_common_error::AWS_ERROR_UNSUPPORTED_OPERATION as i32).into())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
     use crate::common::allocator::Allocator;
+    use crate::io::event_loop::EventLoopGroup;
     use crate::io::stream::InputStream;
 
     // An implementation of [GenericInputStream] that always reads 0s.
@@ -323,17 +529,17 @@ mod test {
     struct ZeroStream;
 
     impl GenericInputStream for ZeroStream {
-        fn seek(&self, _offset: i64, _basis: aws_stream_seek_basis) -> Result<(), Error> {
+        fn seek(&mut self, _offset: i64, _basis: SeekBasis) -> Result<(), Error> {
             Ok(())
         }
 
-        fn read(&self, buffer: &mut [u8]) -> Result<usize, Error> {
+        fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Error> {
             buffer.fill(0u8);
             Ok(buffer.len())
         }
 
-        fn get_status(&self) -> Result<aws_stream_status, Error> {
-            Ok(aws_stream_status {
+        fn get_status(&self) -> Result<StreamStatus, Error> {
+            Ok(StreamStatus {
                 is_end_of_stream: false,
                 is_valid: true,
             })
@@ -352,7 +558,7 @@ mod test {
         let bytes = b"Hello world!".to_vec();
 
         // Create a new CRT input stream from this slice.
-        let stream =
+        let mut stream =
             InputStream::new_from_slice(&mut allocator, &bytes[..]).expect("failed to make input stream from slice");
 
         let mut buffer = vec![0u8; 40];
@@ -385,5 +591,25 @@ mod test {
 
         let nread = stream.read(&mut buffer).expect("read failed");
         assert_eq!(nread, buffer.len());
+    }
+
+    #[test]
+    fn test_async_input_stream() {
+        let mut allocator = Allocator::default();
+
+        let el_group = EventLoopGroup::new_default(&mut allocator, None, || {}).unwrap();
+        let event_loop = el_group.get_next_loop().unwrap();
+
+        let contents: Vec<u8> = (0..255).collect();
+
+        let futures_stream = futures::stream::iter(contents.chunks(16).map(|b| b.to_owned()).collect::<Vec<_>>());
+
+        let mut input_stream = AsyncInputStream::new(event_loop, futures_stream);
+
+        let mut buffer = vec![0u8; contents.len()];
+        let mut offset = 0;
+        while !input_stream.get_status().unwrap().is_end_of_stream {
+            offset += input_stream.read(&mut buffer[offset..]).unwrap();
+        }
     }
 }
