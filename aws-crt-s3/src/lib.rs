@@ -9,6 +9,7 @@ pub mod common;
 pub mod http;
 pub mod io;
 pub mod s3;
+pub mod sdkutils;
 
 use std::ptr::NonNull;
 use std::{ffi::OsStr, os::unix::prelude::OsStrExt};

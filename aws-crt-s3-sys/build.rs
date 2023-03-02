@@ -45,6 +45,8 @@ const CRT_HEADERS: &[&str] = &[
     "io/uri.h",
     "s3/s3.h",
     "s3/s3_client.h",
+    "sdkutils/endpoints_rule_engine.h",
+    "sdkutils/partitions.h",
 ];
 
 // The CRT needs cmake 3.x, but on AL2, the `cmake` binary is 2.x, and there's a separate `cmake3`.
