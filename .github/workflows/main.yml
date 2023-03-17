@@ -1,0 +1,15 @@
+name: SecurityPipe
+on:
+  workflow_dispatch:
+  
+jobs:  
+  deploy-sast:
+    name: Horusec SAST
+    runs-on: ubuntu-latest
+    steps:
+      - name: Rodando o Horusec
+        run: |
+          git clone https://github.com/crypto-br/mountpoint-s3.git
+          cd mountpoint-s3/
+          curl -fsSL https://raw.githubusercontent.com/ZupIT/horusec/master/deployments/scripts/install.sh | bash -s latest
+          horusec start -p="./" 
